@@ -35,22 +35,24 @@ void find(char *path, char *target)
         return;
     }
     
-    // 检查当前路径是否匹配目标
-    p = path + strlen(path);
-    while (p >= path && *p != '/')
-        p--;
-    p++;
-    
-    if (strcmp(p, target) == 0) {
-        printf("%s\n", path);
-    }
-    
-    // 如果是目录，递归搜索
-    if (st.type == T_DIR) {
+    switch (st.type) {
+    case T_FILE:
+        // 如果是文件，检查文件名是否匹配
+        p = path + strlen(path);
+        while (p >= path && *p != '/')
+            p--;
+        p++;
+        
+        if (strcmp(p, target) == 0) {
+            printf("%s\n", path);
+        }
+        break;
+        
+    case T_DIR:
+        // 如果是目录，递归搜索
         if (strlen(path) + 1 + DIRSIZ + 1 > sizeof buf) {
             fprintf(2, "find: path too long\n");
-            close(fd);
-            return;
+            break;
         }
         
         strcpy(buf, path);
@@ -70,6 +72,7 @@ void find(char *path, char *target)
             
             find(buf, target);
         }
+        break;
     }
     
     close(fd);
