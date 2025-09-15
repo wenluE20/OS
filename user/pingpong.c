@@ -13,36 +13,39 @@ int main() {
     pipe(f2c);
     
     char buf[1];
+    int child_pid;
     
-    if (fork() == 0) {//son
-        close(f2c[1]);  // close the father until the son's writing
-        close(c2f[0]);  // close the son until the father's reading
+    if ((child_pid = fork()) == 0) { // 子进程
+        close(f2c[1]);  // 关闭父进程写入端
+        close(c2f[0]);  // 关闭子进程读取端
         
-        // read from the father
-        read(f2c[0], buf, 1);
-        printf("%d: received ping from pid %d\n", getpid(), getpid());
+        // 从父进程读取数据和父进程PID
+        int parent_pid;
+        read(f2c[0], &parent_pid, sizeof(parent_pid));
+        printf("%d: received ping from pid %d\n", getpid(), parent_pid);
         
-        // write into the father
+        // 写入到父进程
         write(c2f[1], "p", 1);
         
         close(f2c[0]);
         close(c2f[1]);
         exit(0);
     } else {
-        // father
-        close(f2c[0]);  // close the father until the son's reading
-        close(c2f[1]);  // close the son until the father's writing
+        // 父进程
+        close(f2c[0]);  // 关闭父进程读取端
+        close(c2f[1]);  // 关闭子进程写入端
         
-        // writing into the son
-        write(f2c[1], "p", 1);
+        // 写入父进程PID到子进程
+        int my_pid = getpid();
+        write(f2c[1], &my_pid, sizeof(my_pid));
         
-        // reading  from the son
+        // 从子进程读取
         read(c2f[0], buf, 1);
-        printf("%d: received pong from pid %d\n", getpid(), getpid() - 1); 
+        printf("%d: received pong from pid %d\n", getpid(), child_pid);
         
         close(f2c[1]);
         close(c2f[0]);
-        wait(0); // waiting for the son finnish
+        wait(0); // 等待子进程结束
         exit(0);
     }
     
