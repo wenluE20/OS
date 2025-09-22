@@ -1,0 +1,237 @@
+diff --git a/Makefile b/Makefile
+index b971308..f40ac6f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -157,7 +157,9 @@ UPROGS=\
+ 	$U/_grind\
+ 	$U/_wc\
+ 	$U/_zombie\
+-
++	$U/_sleep\
++	$U/_pingpong\
++	$U/_find\
+ 
+ ifeq ($(LAB),syscall)
+ UPROGS += \
+@@ -242,15 +244,8 @@ qemu-gdb: $K/kernel .gdbinit fs.img
+ 	@echo "*** Now run 'gdb' in another window." 1>&2
+ 	$(QEMU) $(QEMUOPTS) -S $(QEMUGDB)
+ 
+-GDBARGS = 
+-GDBARGS += -ex 'set architecture riscv:rv64'
+-GDBARGS += -ex 'target remote 127.0.0.1:$(GDBPORT)'
+-GDBARGS += -ex 'symbol-file kernel/kernel'
+-GDBARGS += -ex 'set riscv use-compressed-breakpoints yes'
+-
+-
+ gdb: 
+-	$(GDB) $(GDBARGS)
++	$(GDB)
+ 
+ ##
+ ##  FOR testing lab grading script
+diff --git a/commands.gdb b/commands.gdb
+new file mode 100644
+index 0000000..ee7cd10
+--- /dev/null
++++ b/commands.gdb
+@@ -0,0 +1,33 @@
++si 5
++b *0x80000086
++c
++u 58
++p main
++si
++n 17
++s
++n 7
++p p->name
++finish
++b main.c:42
++c
++s
++n 8
++si 33
++n 5
++s
++n
++p p->name
++u 112
++si 94
++n 5
++p p->name
++n 9
++s
++n
++p p->name
++u 112
++si 49
++add-symbol-file user/_init
++da
++n 7
+\ No newline at end of file
+diff --git a/user/find.c b/user/find.c
+new file mode 100644
+index 0000000..09b60eb
+--- /dev/null
++++ b/user/find.c
+@@ -0,0 +1,76 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++#include "kernel/fs.h"
++#include "kernel/fcntl.h"
++
++void find(char *path, char *target);
++
++int main(int argc, char *argv[])
++{
++    if (argc != 3) {
++        fprintf(2, "Usage: find <path> <name>\n");
++        exit(1);
++    }
++    
++    find(argv[1], argv[2]);
++    exit(0);
++}
++
++void find(char *path, char *target)
++{
++    char buf[512], *p;
++    int fd;
++    struct dirent de;
++    struct stat st;
++    
++    if ((fd = open(path, O_RDONLY)) < 0) {
++        fprintf(2, "find: cannot open %s\n", path);
++        return;
++    }
++    
++    if (fstat(fd, &st) < 0) {
++        fprintf(2, "find: cannot stat %s\n", path);
++        close(fd);
++        return;
++    }
++    
++    // 对于文件或目录，都检查名称是否匹配
++    p = path + strlen(path);
++    while (p >= path && *p != '/')
++        p--;
++    p++;
++    
++    if (strcmp(p, target) == 0) {
++        printf("%s\n", path);
++    }
++    
++    // 如果是目录，递归搜索
++    if (st.type == T_DIR) {
++        if (strlen(path) + 1 + DIRSIZ + 1 > sizeof buf) {
++            fprintf(2, "find: path too long\n");
++            close(fd);
++            return;
++        }
++        
++        strcpy(buf, path);
++        p = buf + strlen(buf);
++        *p++ = '/';
++        
++        while (read(fd, &de, sizeof(de)) == sizeof(de)) {
++            if (de.inum == 0)
++                continue;
++                
++            // 跳过 "." 和 ".."
++            if (strcmp(de.name, ".") == 0 || strcmp(de.name, "..") == 0)
++                continue;
++                
++            memmove(p, de.name, DIRSIZ);
++            p[DIRSIZ] = 0;
++            
++            find(buf, target);
++        }
++    }
++    
++    close(fd);
++}
+\ No newline at end of file
+diff --git a/user/pingpong.c b/user/pingpong.c
+new file mode 100644
+index 0000000..a88e982
+--- /dev/null
++++ b/user/pingpong.c
+@@ -0,0 +1,53 @@
++#include "kernel/types.h"
++#include "kernel/stat.h"
++#include "user/user.h"
++
++int main() {
++    // create two channels
++    // c2f: son to the father
++    // f2c: father to the son
++    int c2f[2];
++    int f2c[2];
++    
++    pipe(c2f);
++    pipe(f2c);
++    
++    char buf[1];
++    int child_pid;
++    
++    if ((child_pid = fork()) == 0) { // 子进程
++        close(f2c[1]);  // 关闭父进程写入端
++        close(c2f[0]);  // 关闭子进程读取端
++        
++        // 从父进程读取数据和父进程PID
++        int parent_pid;
++        read(f2c[0], &parent_pid, sizeof(parent_pid));
++        printf("%d: received ping from pid %d\n", getpid(), parent_pid);
++        
++        // 写入到父进程
++        write(c2f[1], "p", 1);
++        
++        close(f2c[0]);
++        close(c2f[1]);
++        exit(0);
++    } else {
++        // 父进程
++        close(f2c[0]);  // 关闭父进程读取端
++        close(c2f[1]);  // 关闭子进程写入端
++        
++        // 写入父进程PID到子进程
++        int my_pid = getpid();
++        write(f2c[1], &my_pid, sizeof(my_pid));
++        
++        // 从子进程读取
++        read(c2f[0], buf, 1);
++        printf("%d: received pong from pid %d\n", getpid(), child_pid);
++        
++        close(f2c[1]);
++        close(c2f[0]);
++        wait(0); // 等待子进程结束
++        exit(0);
++    }
++    
++    return 0;
++}
+\ No newline at end of file
+diff --git a/user/sleep.c b/user/sleep.c
+new file mode 100644
+index 0000000..6444ae8
+--- /dev/null
++++ b/user/sleep.c
+@@ -0,0 +1,16 @@
++#include "kernel/types.h"
++#include "user.h"
++
++int main(int argc,char* argv[])
++{
++    if(argc != 2)
++    {
++        printf("Sleep needs one argument!\n");//check the number of parameters
++        exit(-1); 
++    }
++    int ticks = atoi(argv[1]);//change the string into the int
++    sleep(ticks);//use the system sleep
++    printf("(nothing happens for a little while)\n");
++    exit(0);//make sure it exit
++    
++}
