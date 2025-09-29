@@ -335,6 +335,39 @@ void exit(int status) {
   // we need the parent's lock in order to wake it up from wait().
   // the parent-then-child rule says we have to lock it first.
   acquire(&original_parent->lock);
+  
+  // Print parent process information
+  // Convert parent state to lowercase string
+  const char *parent_state_str;
+  switch (original_parent->state) {
+    case UNUSED: parent_state_str = "unused"; break;
+    case SLEEPING: parent_state_str = "sleeping"; break;
+    case RUNNABLE: parent_state_str = "runnable"; break;
+    case RUNNING: parent_state_str = "running"; break;
+    case ZOMBIE: parent_state_str = "zombie"; break;
+    default: parent_state_str = "unknown";
+  }
+  exit_info("proc %d exit, parent pid %d, name %s, state %s\n", p->pid, original_parent->pid, original_parent->name, parent_state_str);
+  
+  // Print all child processes information
+  int child_num = 0;
+  for (struct proc *pp = proc; pp < &proc[NPROC]; pp++) {
+    if (pp->parent == p) {
+      acquire(&pp->lock);
+      // Convert child state to lowercase string
+      const char *child_state_str;
+      switch (pp->state) {
+        case UNUSED: child_state_str = "unused"; break;
+        case SLEEPING: child_state_str = "sleeping"; break;
+        case RUNNABLE: child_state_str = "runnable"; break;
+        case RUNNING: child_state_str = "running"; break;
+        case ZOMBIE: child_state_str = "zombie"; break;
+        default: child_state_str = "unknown";
+      }
+      exit_info("proc %d exit, child %d, pid %d, name %s, state %s\n", p->pid, child_num++, pp->pid, pp->name, child_state_str);
+      release(&pp->lock);
+    }
+  }
 
   acquire(&p->lock);
 
@@ -355,8 +388,8 @@ void exit(int status) {
 }
 
 // Wait for a child process to exit and return its pid.
-// Return -1 if this process has no children.
-int wait(uint64 addr) {
+// Return -1 if this process has no children or in non-blocking mode with no zombie children.
+int wait(uint64 addr, int flags) {
   struct proc *np;
   int havekids, pid;
   struct proc *p = myproc();
@@ -400,7 +433,13 @@ int wait(uint64 addr) {
       return -1;
     }
 
-    // Wait for a child to exit.
+    // In non-blocking mode, return -1 immediately if no zombie children found
+    if (flags == 1) {
+      release(&p->lock);
+      return -1;
+    }
+
+    // Wait for a child to exit in blocking mode.
     sleep(p, &p->lock);  // DOC: wait-sleep
   }
 }

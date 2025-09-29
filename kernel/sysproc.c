@@ -20,8 +20,13 @@ uint64 sys_fork(void) { return fork(); }
 
 uint64 sys_wait(void) {
   uint64 p;
+  int flags = 0;  // 默认阻塞模式
+  
   if (argaddr(0, &p) < 0) return -1;
-  return wait(p);
+  // 尝试获取第二个参数flags，如果用户提供了的话
+  argint(1, &flags);
+  
+  return wait(p, flags);
 }
 
 uint64 sys_sbrk(void) {
@@ -79,5 +84,55 @@ uint64 sys_rename(void) {
   struct proc *p = myproc();
   memmove(p->name, name, len);
   p->name[len] = '\0';
+  return 0;
+}
+
+uint64 sys_yield(void) {
+  struct proc *p = myproc();
+  
+  // 打印当前进程的内核线程上下文被保存的地址范围
+ printf("Save the context of the process to the memory region from address %p to %p\n", &p->context, (char*)&p->context + sizeof(struct context));
+  
+  // 打印当前进程的pid和用户态pc值（ecall指令的地址）
+  printf("Current running process pid is %d and user pc is %p\n", p->pid, p->trapframe->epc);
+  
+  // 找到下一个RUNNABLE的进程
+  struct proc *next_p = 0;
+  int current_index = -1;
+  
+  // 先找到当前进程在进程表中的索引
+  for (int i = 0; i < NPROC; i++) {
+    if (&proc[i] == p) {
+      current_index = i;
+      break;
+    }
+  }
+  
+  // 环形遍历进程表，从当前进程的下一个开始寻找RUNNABLE的进程
+  if (current_index != -1) {
+    for (int i = 0; i < NPROC; i++) {
+      int j = (current_index + 1 + i) % NPROC;
+      
+      // 为了安全检查进程状态，需要获取锁
+      acquire(&proc[j].lock);
+      if (proc[j].state == RUNNABLE) {
+        next_p = &proc[j];
+        release(&proc[j].lock);
+        break;
+      }
+      release(&proc[j].lock);
+    }
+  }
+  
+  // 打印即将被调度到的进程的信息
+  if (next_p) {
+    acquire(&next_p->lock);
+    printf("Next runnable process pid is %d and user pc is %p\n", next_p->pid, next_p->trapframe->epc);
+    release(&next_p->lock);
+  }
+  
+  // 让出CPU
+  yield();
+  
   return 0;
 }
