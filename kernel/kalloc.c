@@ -18,15 +18,25 @@ struct run {
   struct run *next;
 };
 
-struct {
+struct kmem {
   struct spinlock lock;
   struct run *freelist;
-} kmem;
+};
+
+static struct kmem kmems[NCPU];
+static char kmemlockname[NCPU][16];
+
+static void kfree_into_cpu(void *pa, int cpu);
+static struct run *kalloc_from_cpu(int cpu);
 
 void
 kinit()
 {
-  initlock(&kmem.lock, "kmem");
+  for(int i = 0; i < NCPU; i++){
+    snprintf(kmemlockname[i], sizeof(kmemlockname[i]), "kmem%d", i);
+    initlock(&kmems[i].lock, kmemlockname[i]);
+    kmems[i].freelist = 0;
+  }
   freerange(end, (void*)PHYSTOP);
 }
 
@@ -34,9 +44,12 @@ void
 freerange(void *pa_start, void *pa_end)
 {
   char *p;
+  int cpu = 0;
   p = (char*)PGROUNDUP((uint64)pa_start);
-  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE)
-    kfree(p);
+  for(; p + PGSIZE <= (char*)pa_end; p += PGSIZE){
+    kfree_into_cpu(p, cpu);
+    cpu = (cpu + 1) % NCPU;
+  }
 }
 
 // Free the page of physical memory pointed at by v,
@@ -46,20 +59,14 @@ freerange(void *pa_start, void *pa_end)
 void
 kfree(void *pa)
 {
-  struct run *r;
-
   if(((uint64)pa % PGSIZE) != 0 || (char*)pa < end || (uint64)pa >= PHYSTOP)
     panic("kfree");
 
-  // Fill with junk to catch dangling refs.
-  memset(pa, 1, PGSIZE);
+  push_off();
+  int id = cpuid();
+  pop_off();
 
-  r = (struct run*)pa;
-
-  acquire(&kmem.lock);
-  r->next = kmem.freelist;
-  kmem.freelist = r;
-  release(&kmem.lock);
+  kfree_into_cpu(pa, id);
 }
 
 // Allocate one 4096-byte page of physical memory.
@@ -69,14 +76,53 @@ void *
 kalloc(void)
 {
   struct run *r;
+  int id;
 
-  acquire(&kmem.lock);
-  r = kmem.freelist;
-  if(r)
-    kmem.freelist = r->next;
-  release(&kmem.lock);
+  push_off();
+  id = cpuid();
+  pop_off();
+
+  r = kalloc_from_cpu(id);
+  if(r == 0){
+    for(int i = 0; i < NCPU; i++){
+      if(i == id)
+        continue;
+      r = kalloc_from_cpu(i);
+      if(r)
+        break;
+    }
+  }
 
   if(r)
     memset((char*)r, 5, PGSIZE); // fill with junk
   return (void*)r;
+}
+
+static void
+kfree_into_cpu(void *pa, int cpu)
+{
+  struct run *r;
+
+  // Fill with junk to catch dangling refs.
+  memset(pa, 1, PGSIZE);
+
+  r = (struct run*)pa;
+
+  acquire(&kmems[cpu].lock);
+  r->next = kmems[cpu].freelist;
+  kmems[cpu].freelist = r;
+  release(&kmems[cpu].lock);
+}
+
+static struct run *
+kalloc_from_cpu(int cpu)
+{
+  struct run *r;
+
+  acquire(&kmems[cpu].lock);
+  r = kmems[cpu].freelist;
+  if(r)
+    kmems[cpu].freelist = r->next;
+  release(&kmems[cpu].lock);
+  return r;
 }
