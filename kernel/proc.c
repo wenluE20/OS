@@ -226,20 +226,39 @@ void userinit(void) {
 
 // Grow or shrink user memory by n bytes.
 // Return 0 on success, -1 on failure.
-int growproc(int n) {
-  uint sz;
+int growproc(int n){
   struct proc *p = myproc();
+  uint64 sz = p->sz;
+  uint64 newsz;
 
-  sz = p->sz;
   if (n > 0) {
-    if ((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
+    newsz = uvmalloc(p->pagetable, sz, sz + (uint64)n);
+    if (newsz == 0)
       return -1;
-    }
+    p->sz = newsz;
   } else if (n < 0) {
-    sz = uvmdealloc(p->pagetable, sz, sz + n);
+    uint64 dec = (uint64)(-n);
+    uint64 target = (sz >= dec) ? (sz - dec) : 0;
+    newsz = uvmdealloc(p->pagetable, sz, target);
+    p->sz = newsz;
   }
-  p->sz = sz;
+
+  // 同步 per-proc 内核页表镜像（你已有）
   sync_pagetable(p);
+
+  // 刷当前（内核页表）TLB
+  sfence_vma();
+
+  // 关键：用户页表的 TLB 也要刷。临时切到用户页表 -> sfence -> 切回
+  uint64 oldsatp = r_satp();
+  uint64 usersatp = MAKE_SATP(p->pagetable);
+  if (oldsatp != usersatp) {
+    w_satp(usersatp);
+    sfence_vma();        // 刷用户地址空间的 TLB
+    w_satp(oldsatp);     // 切回内核态使用的页表
+    sfence_vma();        // 再刷一次当前（内核）地址空间，确保一致
+  }
+
   return 0;
 }
 
