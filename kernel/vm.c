@@ -5,6 +5,8 @@
 #include "riscv.h"
 #include "defs.h"
 #include "fs.h"
+#include "spinlock.h"
+#include "proc.h"
 
 /*
  * the kernel's page table.
@@ -15,6 +17,11 @@ extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[];  // trampoline.S
 static void freewalk_kernel(pagetable_t pagetable);
+static void clear_kpagetable_user_mappings(pagetable_t pagetable);
+
+#define USER_VA_END 0x0C000000ULL
+#define L1_PAGE_SPAN (PGSIZE * 512ULL)
+#define USER_L1_ENTRIES (USER_VA_END / L1_PAGE_SPAN)
 
 /*
  * create a direct-map page table for the kernel.
@@ -76,6 +83,61 @@ err:
   return 0;
 }
 
+static void clear_kpagetable_user_mappings(pagetable_t pagetable) {
+  if (pagetable == 0) return;
+  pte_t *pte = &pagetable[PX(2, 0)];
+  if ((*pte & PTE_V) == 0) return;
+  pagetable_t l1 = (pagetable_t)PTE2PA(*pte);
+  memset(l1, 0, PGSIZE);
+}
+
+void sync_pagetable(struct proc *p) {
+  if (p == 0) return;
+  pagetable_t kpagetable = p->k_pagetable;
+  pagetable_t upagetable = p->pagetable;
+  if (kpagetable == 0 || upagetable == 0) return;
+
+  pte_t *kpte = &kpagetable[PX(2, 0)];
+  pagetable_t kl1;
+  if ((*kpte & PTE_V) == 0) {
+    kl1 = (pagetable_t)kalloc();
+    if (kl1 == 0) panic("sync_pagetable: kalloc");
+    memset(kl1, 0, PGSIZE);
+    *kpte = PA2PTE(kl1) | PTE_V;
+  } else {
+    kl1 = (pagetable_t)PTE2PA(*kpte);
+  }
+
+  // Keep the kernel device mappings that live outside the user portion
+  // of the address space in sync with the global kernel page table.
+  pte_t *gkpte = &kernel_pagetable[PX(2, 0)];
+  pagetable_t gl1 = 0;
+  if (*gkpte & PTE_V) gl1 = (pagetable_t)PTE2PA(*gkpte);
+
+  for (int i = USER_L1_ENTRIES; i < 512; i++) {
+    if (gl1)
+      kl1[i] = gl1[i];
+    else
+      kl1[i] = 0;
+  }
+
+  for (int i = 0; i < USER_L1_ENTRIES; i++) kl1[i] = 0;
+
+  pte_t *upte = &upagetable[PX(2, 0)];
+  if ((*upte & PTE_V) == 0) {
+    sfence_vma();
+    return;
+  }
+
+  pagetable_t ul1 = (pagetable_t)PTE2PA(*upte);
+  for (int i = 0; i < USER_L1_ENTRIES; i++) {
+    pte_t entry = ul1[i];
+    if (entry & PTE_V) kl1[i] = entry;
+  }
+
+  sfence_vma();
+}
+
 static void freewalk_kernel(pagetable_t pagetable) {
   for (int i = 0; i < 512; i++) {
     pte_t pte = pagetable[i];
@@ -94,6 +156,7 @@ static void freewalk_kernel(pagetable_t pagetable) {
 
 void proc_kfreepagetable(pagetable_t pagetable) {
   if (pagetable == 0) return;
+  clear_kpagetable_user_mappings(pagetable);
   freewalk_kernel(pagetable);
 }
 
@@ -411,21 +474,11 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
 // Copy len bytes to dst from virtual address srcva in a given page table.
 // Return 0 on success, -1 on error.
 int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
-  uint64 n, va0, pa0;
-
-  while (len > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > len) n = len;
-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
-
-    len -= n;
-    dst += n;
-    srcva = va0 + PGSIZE;
-  }
-  return 0;
+  uint64 sstatus = r_sstatus();
+  w_sstatus(sstatus | SSTATUS_SUM);
+  int ret = copyin_new(pagetable, dst, srcva, len);
+  w_sstatus(sstatus);
+  return ret;
 }
 
 // Copy a null-terminated string from user to kernel.
@@ -433,38 +486,11 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
 // until a '\0', or max.
 // Return 0 on success, -1 on error.
 int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
-  uint64 n, va0, pa0;
-  int got_null = 0;
-
-  while (got_null == 0 && max > 0) {
-    va0 = PGROUNDDOWN(srcva);
-    pa0 = walkaddr(pagetable, va0);
-    if (pa0 == 0) return -1;
-    n = PGSIZE - (srcva - va0);
-    if (n > max) n = max;
-
-    char *p = (char *)(pa0 + (srcva - va0));
-    while (n > 0) {
-      if (*p == '\0') {
-        *dst = '\0';
-        got_null = 1;
-        break;
-      } else {
-        *dst = *p;
-      }
-      --n;
-      --max;
-      p++;
-      dst++;
-    }
-
-    srcva = va0 + PGSIZE;
-  }
-  if (got_null) {
-    return 0;
-  } else {
-    return -1;
-  }
+  uint64 sstatus = r_sstatus();
+  w_sstatus(sstatus | SSTATUS_SUM);
+  int ret = copyinstr_new(pagetable, dst, srcva, max);
+  w_sstatus(sstatus);
+  return ret;
 }
 
 // check if use global kpgtbl or not

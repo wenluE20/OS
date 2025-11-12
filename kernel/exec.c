@@ -96,6 +96,7 @@ int exec(char *path, char **argv) {
   p->trapframe->epc = elf.entry;  // initial program counter = main
   p->trapframe->sp = sp;          // initial stack pointer
   proc_freepagetable(oldpagetable, oldsz);
+  sync_pagetable(p);
 
 if (p -> pid == 1){
   vmprint(p -> pagetable);
