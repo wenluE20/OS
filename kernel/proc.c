@@ -20,6 +20,7 @@ static void wakeup1(struct proc *chan);
 static void freeproc(struct proc *p);
 
 extern char trampoline[];  // trampoline.S
+extern pagetable_t kernel_pagetable;
 
 // initialize the proc table at boot time.
 void procinit(void) {
@@ -37,6 +38,8 @@ void procinit(void) {
     uint64 va = KSTACK((int)(p - proc));
     kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
     p->kstack = va;
+    p->kstack_pa = (uint64)pa;
+    p->k_pagetable = 0;
   }
   kvminithart();
 }
@@ -97,8 +100,21 @@ static struct proc *allocproc(void) {
 found:
   p->pid = allocpid();
 
+  if ((p->k_pagetable = proc_kpagetable()) == 0) {
+    release(&p->lock);
+    return 0;
+  }
+
+  if (mappages(p->k_pagetable, p->kstack, PGSIZE, p->kstack_pa, PTE_R | PTE_W) != 0) {
+    proc_kfreepagetable(p->k_pagetable);
+    p->k_pagetable = 0;
+    release(&p->lock);
+    return 0;
+  }
+
   // Allocate a trapframe page.
   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
+    freeproc(p);
     release(&p->lock);
     return 0;
   }
@@ -128,6 +144,8 @@ static void freeproc(struct proc *p) {
   p->trapframe = 0;
   if (p->pagetable) proc_freepagetable(p->pagetable, p->sz);
   p->pagetable = 0;
+  if (p->k_pagetable) proc_kfreepagetable(p->k_pagetable);
+  p->k_pagetable = 0;
   p->sz = 0;
   p->pid = 0;
   p->parent = 0;
@@ -430,10 +448,15 @@ void scheduler(void) {
         // before jumping back to us.
         p->state = RUNNING;
         c->proc = p;
+        if (p->k_pagetable == 0) panic("scheduler: no kpagetable");
+        w_satp(MAKE_SATP(p->k_pagetable));
+        sfence_vma();
         swtch(&c->context, &p->context);
 
         // Process is done running for now.
         // It should have changed its p->state before coming back.
+        w_satp(MAKE_SATP(kernel_pagetable));
+        sfence_vma();
         c->proc = 0;
 
         found = 1;

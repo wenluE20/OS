@@ -14,6 +14,7 @@ pagetable_t kernel_pagetable;
 extern char etext[];  // kernel.ld sets this to end of kernel code.
 
 extern char trampoline[];  // trampoline.S
+static void freewalk_kernel(pagetable_t pagetable);
 
 /*
  * create a direct-map page table for the kernel.
@@ -50,6 +51,100 @@ void kvminit() {
 void kvminithart() {
   w_satp(MAKE_SATP(kernel_pagetable));
   sfence_vma();
+}
+
+pagetable_t proc_kpagetable(void) {
+  pagetable_t pagetable = (pagetable_t)kalloc();
+  if (pagetable == 0) return 0;
+  memset(pagetable, 0, PGSIZE);
+
+  if (mappages(pagetable, UART0, PGSIZE, UART0, PTE_R | PTE_W) != 0) goto err;
+  if (mappages(pagetable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) != 0) goto err;
+  if (mappages(pagetable, PLIC, 0x400000, PLIC, PTE_R | PTE_W) != 0) goto err;
+  if (mappages(pagetable, KERNBASE, (uint64)etext - KERNBASE, KERNBASE, PTE_R | PTE_X) != 0)
+    goto err;
+  if (mappages(pagetable, (uint64)etext, PHYSTOP - (uint64)etext, (uint64)etext,
+               PTE_R | PTE_W) != 0)
+    goto err;
+  if (mappages(pagetable, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X) != 0)
+    goto err;
+
+  return pagetable;
+
+err:
+  proc_kfreepagetable(pagetable);
+  return 0;
+}
+
+static void freewalk_kernel(pagetable_t pagetable) {
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if (pte & PTE_V) {
+      if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+        uint64 child = PTE2PA(pte);
+        freewalk_kernel((pagetable_t)child);
+        pagetable[i] = 0;
+      } else {
+        pagetable[i] = 0;
+      }
+    }
+  }
+  kfree((void *)pagetable);
+}
+
+void proc_kfreepagetable(pagetable_t pagetable) {
+  if (pagetable == 0) return;
+  freewalk_kernel(pagetable);
+}
+
+// 构造缩进："||", "|| ||", "|| || ||"
+static void build_indent(char *buf, int depth) {
+  char *p = buf;
+  for (int k = 0; k < depth; k++) {
+    *p++ = '|'; *p++ = '|';
+    if (k != depth - 1) *p++ = ' ';
+  }
+  *p = '\0';
+}
+
+static void vmprintwalk(pagetable_t pagetable, int level, uint64 base_va) {
+  if (level < 0) return;
+
+  for (int i = 0; i < 512; i++) {
+    pte_t pte = pagetable[i];
+    if ((pte & PTE_V) == 0) continue;
+
+    uint64 pa = PTE2PA(pte);
+    uint64 child_va = base_va | ((uint64)i << PXSHIFT(level));
+
+    int depth = 3 - level;
+    char indent[32];
+    build_indent(indent, depth);
+
+    char flags[5];
+    flags[0] = (pte & PTE_R) ? 'r' : '-';
+    flags[1] = (pte & PTE_W) ? 'w' : '-';
+    flags[2] = (pte & PTE_X) ? 'x' : '-';
+    flags[3] = (pte & PTE_U) ? 'u' : '-';
+    flags[4] = '\0';
+
+    if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
+      // 非叶子：打印子页表页的物理地址
+      printf("%s idx: %d: pa: %p, flags: %s\n",
+             indent, i, (void *)pa, flags);
+      // 递归到下一层：xv6-riscv 中该物理页在内核地址空间等值映射，可直接当指针使用
+      vmprintwalk((pagetable_t)pa, level - 1, child_va);
+    } else {
+      // 叶子：打印 VA -> PA
+      printf("%s idx: %d: va: %p -> pa: %p, flags: %s\n",
+             indent, i, (void *)child_va, (void *)pa, flags);
+    }
+  }
+}
+
+void vmprint(pagetable_t pagetable) {
+  printf("page table %p\n", pagetable);
+  vmprintwalk(pagetable, 2, 0);
 }
 
 // Return the address of the PTE in page table pagetable
