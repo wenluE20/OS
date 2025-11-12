@@ -1,0 +1,544 @@
+diff --git a/.gitignore b/.gitignore
+index 29b599f..bfc6894 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -25,3 +25,4 @@ barrier
+ compile_commands.json
+ .gdb_history
+ .cache/
++commit.patch
+\ No newline at end of file
+diff --git a/Makefile b/Makefile
+index 320eeaa..8c6cc3f 100644
+--- a/Makefile
++++ b/Makefile
+@@ -327,15 +327,8 @@ ping:
+ 	python3 ping.py $(FWDPORT)
+ endif
+ 
+-GDBARGS = 
+-GDBARGS += -ex 'set architecture riscv:rv64'
+-GDBARGS += -ex 'target remote 127.0.0.1:$(GDBPORT)'
+-GDBARGS += -ex 'symbol-file kernel/kernel'
+-GDBARGS += -ex 'set riscv use-compressed-breakpoints yes'
+-
+-
+ gdb: 
+-	$(GDB) $(GDBARGS)
++	$(GDB)
+ 
+ ##
+ ##  FOR testing lab grading script
+diff --git a/grade-lab-pgtbl b/grade-lab-pgtbl
+index 0a03209..0a694bf 100755
+--- a/grade-lab-pgtbl
++++ b/grade-lab-pgtbl
+@@ -22,11 +22,13 @@ IDX_RE = "(idx: [0-9]+)"
+ VAL_RE = "(0x[0-9a-f]+)"
+ FLAGS_RE = "([-r][-w][-x][-u])"
+ INDENT_RE = r"\s*\|\|\s*"
+-INDENT_ESC = "\\\s*\|\|\\\s*"
++INDENT_ESC = "\\\\s*\\|\\|\\\\s*"
+ 
+ @test(50, "pte printout")
+ def test_pteprint():
+     first = True
++    cur_idx = 0
++    first_non_leaf_pte = True
+     r.run_qemu(shell_script([
+         'echo hi'
+     ]))
+@@ -34,25 +36,25 @@ def test_pteprint():
+     p = re.compile(VAL_RE)
+     d = re.compile(INDENT_RE)
+     f = re.compile(FLAGS_RE)
+-    for l in PTE_PRINT.splitlines():
++    for l in PTE_PRINT.splitlines() :
+         l = d.sub(INDENT_ESC, l)
+         l = p.sub(VAL_RE, l)
+         l = f.sub(FLAGS_RE, l)
+-        r.match(r'^{}$'.format(l))
+-        # print("l:", l)
++        r.match(r'^{}\s*$'.format(l))
+         if first:
+             first = False
+         else:
+-            matches = re.findall(r'^{}$'.format(l), r.qemu.output, re.MULTILINE)
+-            # print("matches:", matches[0])
++            matches = re.findall(r'^{}\s*$'.format(l), r.qemu.output, re.MULTILINE)
+             idx = int(re.findall(IDX_RE, l)[0][5:])
+-            # print("idx:", idx)
+-            # flags = matches[0][-1]
+-            # pa = matches[0][-2]
+             if len(matches[0]) > 2:
+-                va = matches[0][-3]
+-                # print("va:", va)
+-                assert_equal((int(va, 16) >> 12) & 0x1ff, idx)
++                first_non_leaf_pte = True
++                va = matches[0][0]
++                assert_equal((int(va, 16) >> 12), idx + (cur_idx << 9))
++            elif len(matches[0]) == 2:
++                if first_non_leaf_pte:
++                    first_non_leaf_pte = False
++                    cur_idx = 0
++                cur_idx = (cur_idx << 9) + idx
+ 
+     
+ 
+diff --git a/kernel/defs.h b/kernel/defs.h
+index 59f7aae..d85d4d2 100644
+--- a/kernel/defs.h
++++ b/kernel/defs.h
+@@ -108,6 +108,7 @@ void            yield(void);
+ int             either_copyout(int user_dst, uint64 dst, void *src, uint64 len);
+ int             either_copyin(void *dst, int user_src, uint64 src, uint64 len);
+ void            procdump(void);
++void            sync_pagetable(struct proc *);
+ 
+ // swtch.S
+ void            swtch(struct context*, struct context*);
+@@ -164,6 +165,8 @@ uint64          kvmpa(uint64);
+ void            kvmmap(uint64, uint64, uint64, int);
+ int             mappages(pagetable_t, uint64, uint64, uint64, int);
+ pagetable_t     uvmcreate(void);
++pagetable_t     proc_kpagetable(void);
++void            proc_kfreepagetable(pagetable_t);
+ void            uvminit(pagetable_t, uchar *, uint);
+ uint64          uvmalloc(pagetable_t, uint64, uint64);
+ uint64          uvmdealloc(pagetable_t, uint64, uint64);
+@@ -178,6 +181,9 @@ uint64          walkaddr(pagetable_t, uint64);
+ int             copyout(pagetable_t, uint64, char *, uint64);
+ int             copyin(pagetable_t, char *, uint64, uint64);
+ int             copyinstr(pagetable_t, char *, uint64, uint64);
++int             copyin_new(pagetable_t, char *, uint64, uint64);
++int             copyinstr_new(pagetable_t, char *, uint64, uint64);
++void          vmprint(pagetable_t);
+ int             test_pagetable();
+ 
+ // plic.c
+diff --git a/kernel/exec.c b/kernel/exec.c
+index 7b8a524..355fd33 100644
+--- a/kernel/exec.c
++++ b/kernel/exec.c
+@@ -96,6 +96,11 @@ int exec(char *path, char **argv) {
+   p->trapframe->epc = elf.entry;  // initial program counter = main
+   p->trapframe->sp = sp;          // initial stack pointer
+   proc_freepagetable(oldpagetable, oldsz);
++  sync_pagetable(p);
++
++if (p -> pid == 1){
++  vmprint(p -> pagetable);
++}
+ 
+   return argc;  // this ends up in a0, the first argument to main(argc, argv)
+ 
+diff --git a/kernel/proc.c b/kernel/proc.c
+index 292ccb8..70bca3f 100644
+--- a/kernel/proc.c
++++ b/kernel/proc.c
+@@ -20,6 +20,7 @@ static void wakeup1(struct proc *chan);
+ static void freeproc(struct proc *p);
+ 
+ extern char trampoline[];  // trampoline.S
++extern pagetable_t kernel_pagetable;
+ 
+ // initialize the proc table at boot time.
+ void procinit(void) {
+@@ -37,6 +38,8 @@ void procinit(void) {
+     uint64 va = KSTACK((int)(p - proc));
+     kvmmap(va, (uint64)pa, PGSIZE, PTE_R | PTE_W);
+     p->kstack = va;
++    p->kstack_pa = (uint64)pa;
++    p->k_pagetable = 0;
+   }
+   kvminithart();
+ }
+@@ -97,8 +100,21 @@ static struct proc *allocproc(void) {
+ found:
+   p->pid = allocpid();
+ 
++  if ((p->k_pagetable = proc_kpagetable()) == 0) {
++    release(&p->lock);
++    return 0;
++  }
++
++  if (mappages(p->k_pagetable, p->kstack, PGSIZE, p->kstack_pa, PTE_R | PTE_W) != 0) {
++    proc_kfreepagetable(p->k_pagetable);
++    p->k_pagetable = 0;
++    release(&p->lock);
++    return 0;
++  }
++
+   // Allocate a trapframe page.
+   if ((p->trapframe = (struct trapframe *)kalloc()) == 0) {
++    freeproc(p);
+     release(&p->lock);
+     return 0;
+   }
+@@ -128,6 +144,8 @@ static void freeproc(struct proc *p) {
+   p->trapframe = 0;
+   if (p->pagetable) proc_freepagetable(p->pagetable, p->sz);
+   p->pagetable = 0;
++  if (p->k_pagetable) proc_kfreepagetable(p->k_pagetable);
++  p->k_pagetable = 0;
+   p->sz = 0;
+   p->pid = 0;
+   p->parent = 0;
+@@ -192,6 +210,7 @@ void userinit(void) {
+   // and data into it.
+   uvminit(p->pagetable, initcode, sizeof(initcode));
+   p->sz = PGSIZE;
++  sync_pagetable(p);
+ 
+   // prepare for the very first "return" from kernel to user.
+   p->trapframe->epc = 0;      // user program counter
+@@ -207,19 +226,39 @@ void userinit(void) {
+ 
+ // Grow or shrink user memory by n bytes.
+ // Return 0 on success, -1 on failure.
+-int growproc(int n) {
+-  uint sz;
++int growproc(int n){
+   struct proc *p = myproc();
++  uint64 sz = p->sz;
++  uint64 newsz;
+ 
+-  sz = p->sz;
+   if (n > 0) {
+-    if ((sz = uvmalloc(p->pagetable, sz, sz + n)) == 0) {
++    newsz = uvmalloc(p->pagetable, sz, sz + (uint64)n);
++    if (newsz == 0)
+       return -1;
+-    }
++    p->sz = newsz;
+   } else if (n < 0) {
+-    sz = uvmdealloc(p->pagetable, sz, sz + n);
++    uint64 dec = (uint64)(-n);
++    uint64 target = (sz >= dec) ? (sz - dec) : 0;
++    newsz = uvmdealloc(p->pagetable, sz, target);
++    p->sz = newsz;
+   }
+-  p->sz = sz;
++
++  // 同步 per-proc 内核页表镜像（你已有）
++  sync_pagetable(p);
++
++  // 刷当前（内核页表）TLB
++  sfence_vma();
++
++  // 关键：用户页表的 TLB 也要刷。临时切到用户页表 -> sfence -> 切回
++  uint64 oldsatp = r_satp();
++  uint64 usersatp = MAKE_SATP(p->pagetable);
++  if (oldsatp != usersatp) {
++    w_satp(usersatp);
++    sfence_vma();        // 刷用户地址空间的 TLB
++    w_satp(oldsatp);     // 切回内核态使用的页表
++    sfence_vma();        // 再刷一次当前（内核）地址空间，确保一致
++  }
++
+   return 0;
+ }
+ 
+@@ -242,6 +281,7 @@ int fork(void) {
+     return -1;
+   }
+   np->sz = p->sz;
++  sync_pagetable(np);
+ 
+   np->parent = p;
+ 
+@@ -430,10 +470,15 @@ void scheduler(void) {
+         // before jumping back to us.
+         p->state = RUNNING;
+         c->proc = p;
++        if (p->k_pagetable == 0) panic("scheduler: no kpagetable");
++        w_satp(MAKE_SATP(p->k_pagetable));
++        sfence_vma();
+         swtch(&c->context, &p->context);
+ 
+         // Process is done running for now.
+         // It should have changed its p->state before coming back.
++        w_satp(MAKE_SATP(kernel_pagetable));
++        sfence_vma();
+         c->proc = 0;
+ 
+         found = 1;
+diff --git a/kernel/proc.h b/kernel/proc.h
+index 9c16ea7..48eac94 100644
+--- a/kernel/proc.h
++++ b/kernel/proc.h
+@@ -95,6 +95,8 @@ struct proc {
+   int pid;                     // Process ID
+ 
+   // these are private to the process, so p->lock need not be held.
++  pagetable_t k_pagetable;     // Kernel page table
++  uint64 kstack_pa;            // Physical address of kernel stack
+   uint64 kstack;               // Virtual address of kernel stack
+   uint64 sz;                   // Size of process memory (bytes)
+   pagetable_t pagetable;       // User page table
+diff --git a/kernel/riscv.h b/kernel/riscv.h
+index 5fbd4e0..f42c73b 100644
+--- a/kernel/riscv.h
++++ b/kernel/riscv.h
+@@ -45,6 +45,7 @@ w_mepc(uint64 x)
+ #define SSTATUS_UPIE (1L << 4) // User Previous Interrupt Enable
+ #define SSTATUS_SIE (1L << 1)  // Supervisor Interrupt Enable
+ #define SSTATUS_UIE (1L << 0)  // User Interrupt Enable
++#define SSTATUS_SUM (1L << 18) // Permit supervisor user memory access
+ 
+ static inline uint64
+ r_sstatus()
+diff --git a/kernel/vm.c b/kernel/vm.c
+index b794885..1c65fce 100644
+--- a/kernel/vm.c
++++ b/kernel/vm.c
+@@ -5,6 +5,8 @@
+ #include "riscv.h"
+ #include "defs.h"
+ #include "fs.h"
++#include "spinlock.h"
++#include "proc.h"
+ 
+ /*
+  * the kernel's page table.
+@@ -14,6 +16,12 @@ pagetable_t kernel_pagetable;
+ extern char etext[];  // kernel.ld sets this to end of kernel code.
+ 
+ extern char trampoline[];  // trampoline.S
++static void freewalk_kernel(pagetable_t pagetable);
++static void clear_kpagetable_user_mappings(pagetable_t pagetable);
++
++#define USER_VA_END 0x0C000000ULL
++#define L1_PAGE_SPAN (PGSIZE * 512ULL)
++#define USER_L1_ENTRIES (USER_VA_END / L1_PAGE_SPAN)
+ 
+ /*
+  * create a direct-map page table for the kernel.
+@@ -52,6 +60,156 @@ void kvminithart() {
+   sfence_vma();
+ }
+ 
++pagetable_t proc_kpagetable(void) {
++  pagetable_t pagetable = (pagetable_t)kalloc();
++  if (pagetable == 0) return 0;
++  memset(pagetable, 0, PGSIZE);
++
++  if (mappages(pagetable, UART0, PGSIZE, UART0, PTE_R | PTE_W) != 0) goto err;
++  if (mappages(pagetable, VIRTIO0, PGSIZE, VIRTIO0, PTE_R | PTE_W) != 0) goto err;
++  if (mappages(pagetable, PLIC, 0x400000, PLIC, PTE_R | PTE_W) != 0) goto err;
++  if (mappages(pagetable, KERNBASE, (uint64)etext - KERNBASE, KERNBASE, PTE_R | PTE_X) != 0)
++    goto err;
++  if (mappages(pagetable, (uint64)etext, PHYSTOP - (uint64)etext, (uint64)etext,
++               PTE_R | PTE_W) != 0)
++    goto err;
++  if (mappages(pagetable, TRAMPOLINE, PGSIZE, (uint64)trampoline, PTE_R | PTE_X) != 0)
++    goto err;
++
++  return pagetable;
++
++err:
++  proc_kfreepagetable(pagetable);
++  return 0;
++}
++
++static void clear_kpagetable_user_mappings(pagetable_t pagetable) {
++  if (pagetable == 0) return;
++  pte_t *pte = &pagetable[PX(2, 0)];
++  if ((*pte & PTE_V) == 0) return;
++  pagetable_t l1 = (pagetable_t)PTE2PA(*pte);
++  memset(l1, 0, PGSIZE);
++}
++
++void sync_pagetable(struct proc *p) {
++  if (p == 0) return;
++  pagetable_t kpagetable = p->k_pagetable;
++  pagetable_t upagetable = p->pagetable;
++  if (kpagetable == 0 || upagetable == 0) return;
++
++  pte_t *kpte = &kpagetable[PX(2, 0)];
++  pagetable_t kl1;
++  if ((*kpte & PTE_V) == 0) {
++    kl1 = (pagetable_t)kalloc();
++    if (kl1 == 0) panic("sync_pagetable: kalloc");
++    memset(kl1, 0, PGSIZE);
++    *kpte = PA2PTE(kl1) | PTE_V;
++  } else {
++    kl1 = (pagetable_t)PTE2PA(*kpte);
++  }
++
++  // Keep the kernel device mappings that live outside the user portion
++  // of the address space in sync with the global kernel page table.
++  pte_t *gkpte = &kernel_pagetable[PX(2, 0)];
++  pagetable_t gl1 = 0;
++  if (*gkpte & PTE_V) gl1 = (pagetable_t)PTE2PA(*gkpte);
++
++  for (int i = USER_L1_ENTRIES; i < 512; i++) {
++    if (gl1)
++      kl1[i] = gl1[i];
++    else
++      kl1[i] = 0;
++  }
++
++  for (int i = 0; i < USER_L1_ENTRIES; i++) kl1[i] = 0;
++
++  pte_t *upte = &upagetable[PX(2, 0)];
++  if ((*upte & PTE_V) == 0) {
++    sfence_vma();
++    return;
++  }
++
++  pagetable_t ul1 = (pagetable_t)PTE2PA(*upte);
++  for (int i = 0; i < USER_L1_ENTRIES; i++) {
++    pte_t entry = ul1[i];
++    if (entry & PTE_V) kl1[i] = entry;
++  }
++
++  sfence_vma();
++}
++
++static void freewalk_kernel(pagetable_t pagetable) {
++  for (int i = 0; i < 512; i++) {
++    pte_t pte = pagetable[i];
++    if (pte & PTE_V) {
++      if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
++        uint64 child = PTE2PA(pte);
++        freewalk_kernel((pagetable_t)child);
++        pagetable[i] = 0;
++      } else {
++        pagetable[i] = 0;
++      }
++    }
++  }
++  kfree((void *)pagetable);
++}
++
++void proc_kfreepagetable(pagetable_t pagetable) {
++  if (pagetable == 0) return;
++  clear_kpagetable_user_mappings(pagetable);
++  freewalk_kernel(pagetable);
++}
++
++// 构造缩进："||", "|| ||", "|| || ||"
++static void build_indent(char *buf, int depth) {
++  char *p = buf;
++  for (int k = 0; k < depth; k++) {
++    *p++ = '|'; *p++ = '|';
++    if (k != depth - 1) *p++ = ' ';
++  }
++  *p = '\0';
++}
++
++static void vmprintwalk(pagetable_t pagetable, int level, uint64 base_va) {
++  if (level < 0) return;
++
++  for (int i = 0; i < 512; i++) {
++    pte_t pte = pagetable[i];
++    if ((pte & PTE_V) == 0) continue;
++
++    uint64 pa = PTE2PA(pte);
++    uint64 child_va = base_va | ((uint64)i << PXSHIFT(level));
++
++    int depth = 3 - level;
++    char indent[32];
++    build_indent(indent, depth);
++
++    char flags[5];
++    flags[0] = (pte & PTE_R) ? 'r' : '-';
++    flags[1] = (pte & PTE_W) ? 'w' : '-';
++    flags[2] = (pte & PTE_X) ? 'x' : '-';
++    flags[3] = (pte & PTE_U) ? 'u' : '-';
++    flags[4] = '\0';
++
++    if ((pte & (PTE_R | PTE_W | PTE_X)) == 0) {
++      // 非叶子：打印子页表页的物理地址
++      printf("%s idx: %d: pa: %p, flags: %s\n",
++             indent, i, (void *)pa, flags);
++      // 递归到下一层：xv6-riscv 中该物理页在内核地址空间等值映射，可直接当指针使用
++      vmprintwalk((pagetable_t)pa, level - 1, child_va);
++    } else {
++      // 叶子：打印 VA -> PA
++      printf("%s idx: %d: va: %p -> pa: %p, flags: %s\n",
++             indent, i, (void *)child_va, (void *)pa, flags);
++    }
++  }
++}
++
++void vmprint(pagetable_t pagetable) {
++  printf("page table %p\n", pagetable);
++  vmprintwalk(pagetable, 2, 0);
++}
++
+ // Return the address of the PTE in page table pagetable
+ // that corresponds to virtual address va.  If alloc!=0,
+ // create any required page-table pages.
+@@ -316,21 +474,11 @@ int copyout(pagetable_t pagetable, uint64 dstva, char *src, uint64 len) {
+ // Copy len bytes to dst from virtual address srcva in a given page table.
+ // Return 0 on success, -1 on error.
+ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
+-  uint64 n, va0, pa0;
+-
+-  while (len > 0) {
+-    va0 = PGROUNDDOWN(srcva);
+-    pa0 = walkaddr(pagetable, va0);
+-    if (pa0 == 0) return -1;
+-    n = PGSIZE - (srcva - va0);
+-    if (n > len) n = len;
+-    memmove(dst, (void *)(pa0 + (srcva - va0)), n);
+-
+-    len -= n;
+-    dst += n;
+-    srcva = va0 + PGSIZE;
+-  }
+-  return 0;
++  uint64 sstatus = r_sstatus();
++  w_sstatus(sstatus | SSTATUS_SUM);
++  int ret = copyin_new(pagetable, dst, srcva, len);
++  w_sstatus(sstatus);
++  return ret;
+ }
+ 
+ // Copy a null-terminated string from user to kernel.
+@@ -338,38 +486,11 @@ int copyin(pagetable_t pagetable, char *dst, uint64 srcva, uint64 len) {
+ // until a '\0', or max.
+ // Return 0 on success, -1 on error.
+ int copyinstr(pagetable_t pagetable, char *dst, uint64 srcva, uint64 max) {
+-  uint64 n, va0, pa0;
+-  int got_null = 0;
+-
+-  while (got_null == 0 && max > 0) {
+-    va0 = PGROUNDDOWN(srcva);
+-    pa0 = walkaddr(pagetable, va0);
+-    if (pa0 == 0) return -1;
+-    n = PGSIZE - (srcva - va0);
+-    if (n > max) n = max;
+-
+-    char *p = (char *)(pa0 + (srcva - va0));
+-    while (n > 0) {
+-      if (*p == '\0') {
+-        *dst = '\0';
+-        got_null = 1;
+-        break;
+-      } else {
+-        *dst = *p;
+-      }
+-      --n;
+-      --max;
+-      p++;
+-      dst++;
+-    }
+-
+-    srcva = va0 + PGSIZE;
+-  }
+-  if (got_null) {
+-    return 0;
+-  } else {
+-    return -1;
+-  }
++  uint64 sstatus = r_sstatus();
++  w_sstatus(sstatus | SSTATUS_SUM);
++  int ret = copyinstr_new(pagetable, dst, srcva, max);
++  w_sstatus(sstatus);
++  return ret;
+ }
+ 
+ // check if use global kpgtbl or not
